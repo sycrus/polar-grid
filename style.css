@@ -1,0 +1,48 @@
+html, body {
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+}
+body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #fff;
+}
+canvas {
+  display: block;
+}
+
+/* bottom control bar; pointer-events stay off everywhere except the
+   buttons and links, so clicks on empty bar area still orbit the scene */
+#menu {
+  position: fixed;
+  left: 0;
+  bottom: 0;
+  width: 100%;
+  box-sizing: border-box;
+  text-align: center;
+  font-family: monospace;
+  font-size: 12px;
+  line-height: 1.8;
+  color: #333;
+  background: rgba(255,255,255,0.85);
+  padding: 5px 0;
+  pointer-events: none;
+}
+#menu button {
+  font-family: monospace;
+  font-size: 11px;
+  margin: 2px 1px;
+  padding: 2px 9px;
+  background: #fff;
+  border: 1px solid #999;
+  border-radius: 3px;
+  color: #333;
+  cursor: pointer;
+  pointer-events: auto;
+}
+#menu button:hover:not(:disabled) { background: #eee; }
+#menu button:disabled { opacity: 0.35; cursor: default; }
+#menu .sep { color: #bbb; margin: 0 8px; }
+#menu .hint a { color: inherit; pointer-events: auto; }
