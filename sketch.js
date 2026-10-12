@@ -4,14 +4,28 @@
 * Click a sphere to select it, drag to move it, shift+drag to rotate it.
 * Arrow keys stretch the selection into an ellipsoid ([ and ] for depth),
 * f freezes the pulse at the current size, r resets the shape (hold shift),
-* shift+g toggles the longitude/latitude grid on all spheres,
+* shift+g toggles the longitude/latitude grid on all spheres (with it on,
+* the letter separates into the grid cells its pixels occupy),
 * shift+s saves the scene as JSON, shift+l loads one back in,
-* backspace deletes the selection; the bottom bar mirrors it all as buttons.
+* shift+i (or right-click) exports the square crop guide as a PNG,
+* backspace deletes the selection; buttons grouped in sections sit on the
+* left of the square, the gesture reference on its right.
+*
+* Edit vs deployed (ADR-029): the sketch boots from settings.js, the saved
+* arrangement of spheres, the grid toggle and the camera. Under `next dev`
+* the adapter adds ?edit: the left panel, file tools, recording, the square
+* crop guide, and "save settings", which writes the current arrangement
+* (hand-built or loaded from a JSON) to settings.js. Deployed, it is
+* view-only: visitors orbit and zoom around the saved arrangement, nothing
+* else (typing and grabbing spheres were too fiddly to steer).
 */
+
+const EDIT_MODE = new URLSearchParams(location.search).has('edit');
 
 let buffer;
 let easycam;
 let sphereR = 220; // radius of the sphere
+const SPAWN_RX = -90; // spawn tilt that points the north pole at the camera, so the letter blooms toward the viewer
 
 let rays = 90; // how many rays (longitude sections)
 let divs = 80; // how many divisions for each ray
@@ -23,11 +37,22 @@ let spheres = [];
 let selectedIndex = -1;
 let drag = null;
 let showGrid = false; // show the longitude/latitude grid on all spheres
+// edit mode, ⇧A: the scene turns about its vertical (y) axis like a
+// turntable, one turn per turnFrames() frames, so a record loop with it on
+// is one full 360° turn
+let autoRotate = false;
+// the turn counts whole frames, and the angle is computed from the count:
+// accumulating a small angle per frame drifts by float rounding, enough
+// that a take's last frame no longer leads exactly into its first
+let spinFrame = 0;
+let spinFrames = 0; // the turn length spinFrame counts within
 let gridGeom;
 let menuButtons = {};
 let menuState = '';
+let menuEl; // left panel: sectioned buttons
+let hintEl; // right panel: gesture reference
 let fileEl; // hidden <input type=file> used by load
-let frameEl; // DOM overlay: square crop guide for recording
+let frameEl; // DOM overlay: square crop guide for recording and export
 
 let rendererGL;
 let myFont;
@@ -44,7 +69,8 @@ function setup(){
   angleMode(DEGREES);
   colorMode(HSB, 100);
   frameRate(60);
-  easycam = createEasyCam();
+  easycam = createEasyCam({ distance: 750 }); // pulled back: the pole-borne letter sits nearer to the camera than the sphere centre
+  if (SETTINGS.camera) easycam.setState(SETTINGS.camera, 0);
   noStroke();
   buffer = createGraphics(800, 800);
   buffer.pixelDensity(1);
@@ -57,14 +83,20 @@ function setup(){
 
   createPolarGrid();
   buildGridGeometry();
-  spheres.push(new LetterSphere('X'));
+  // the saved arrangement, or a lone X when none has been saved
+  spheres = Array.isArray(SETTINGS.scene) && SETTINGS.scene.length
+    ? SETTINGS.scene.map(sphereFromSaved)
+    : [new LetterSphere('X')];
+  showGrid = !!SETTINGS.showGrid;
 
   rendererGL = p5.instance._renderer;
-  addMenu();
-  addLoader();
-  addSquareFrame();
-  addGrabInterceptor();
-  addContextMenuRelease();
+  addSquareFrame(); // first: the panels parent into the square frame
+  if (EDIT_MODE) addMenu();
+  addHint();
+  updateSquareFrame(); // size the panels now that they exist
+  if (EDIT_MODE) addLoader();
+  if (EDIT_MODE) addGrabInterceptor(); // deployed: every drag goes to the camera
+  if (EDIT_MODE) addSquareExport();
 }
 
 // capture-phase mousedown on window: runs before easycam's canvas
@@ -94,18 +126,26 @@ function eventOffset(e) {
   return [e.clientX - r.left, e.clientY - r.top];
 }
 
-// right-click -> "save image as" leaves easycam stuck: its mouseup is on
-// the canvas, but the native menu swallows it, so the right-button bit in
-// its held-button bitmask never clears and every later drag also zooms.
-// release the button synthetically when the menu opens; the menu still works
-function addContextMenuRelease() {
-  canvas.addEventListener('contextmenu', () => {
-    canvas.dispatchEvent(new MouseEvent('mouseup', { button: 2, bubbles: true }));
+// right-click exports the square crop instead of opening the browser's
+// "save image as" (which saved the whole 16:9 canvas, and its swallowed
+// mouseup left easycam's right-button bit stuck). with no native menu the
+// mouseup lands on the canvas as usual, so easycam clears its own state
+function addSquareExport() {
+  canvas.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    saveSquare();
   });
 }
 
-// largest 16:9 rectangle that fits the viewport
+// edit mode: the largest 16:9 rectangle that fits the viewport, with the
+// square crop guide marking the piece. Deployed: just that square, the
+// largest that fits; same height-driven perspective, so it frames exactly
+// what the guide does
 function fitSize() {
+  if (!EDIT_MODE) {
+    const s = min(windowWidth, windowHeight);
+    return [s, s];
+  }
   let w = windowWidth, h = w * 9 / 16;
   if (h > windowHeight) {
     h = windowHeight;
@@ -125,8 +165,10 @@ function windowResized(){
 function addSquareFrame() {
   frameEl = createDiv('');
   frameEl.style('position', 'fixed');
-  frameEl.style('border', '1px solid rgba(0,0,0,0.35)');
-  frameEl.style('box-shadow', '0 0 0 1px rgba(255,255,255,0.35)');
+  if (EDIT_MODE) { // the crop guide is an export aid; deployed, the frame only hosts the hint panel
+    frameEl.style('border', '1px solid rgba(0,0,0,0.35)');
+    frameEl.style('box-shadow', '0 0 0 1px rgba(255,255,255,0.35)');
+  }
   frameEl.style('pointer-events', 'none');
   updateSquareFrame();
 }
@@ -134,43 +176,130 @@ function addSquareFrame() {
 function updateSquareFrame() {
   if (!frameEl) return;
   const side = height; // largest square inscribed in the 16:9 canvas
+  const left = (windowWidth - width) / 2 + (width - side) / 2;
   frameEl.style('width', side + 'px');
   frameEl.style('height', side + 'px');
-  frameEl.style('left', (windowWidth - width) / 2 + (width - side) / 2 + 'px');
+  frameEl.style('left', left + 'px');
   frameEl.style('top', (windowHeight - height) / 2 + 'px');
+  // the panels hang off the square's edges: 28px out from the square, and
+  // never closer than 40px to the window edge (the square is centred, so
+  // both sides are symmetric)
+  const panelW = max(150, min(230, left - 28 - 40));
+  if (menuEl) menuEl.style('width', panelW + 'px');
+  if (hintEl) hintEl.style('width', panelW + 'px');
 }
 
-// clickable control bar pinned to the bottom of the page: buttons for the
-// toggles and file actions, hint text for the mouse/keyboard gestures.
-// DOM, so it never appears in recorded frames
+// a titled section inside one of the flanking panels
+function addSection(panel, title) {
+  const sec = createDiv('');
+  sec.class('sec');
+  sec.parent(panel);
+  createDiv(title).class('sec-title').parent(sec);
+  return sec;
+}
+
+// left panel, hugging the square's left edge: the on-screen buttons, grouped
+// into sections. Child of the square frame element, so it follows it on
+// resize; DOM, so it never appears in recorded frames
 function addMenu() {
-  const bar = createDiv('');
-  bar.id('menu');
-  const btn = (label, fn) => {
-    const b = createButton(label);
-    b.parent(bar);
+  menuEl = createDiv('');
+  menuEl.id('menu');
+  menuEl.class('panel');
+  menuEl.parent(frameEl);
+
+  const btnRow = (sec) => {
+    const btns = createDiv('');
+    btns.class('btns');
+    btns.parent(sec);
+    return btns;
+  };
+  // each button is a full-width row: action on the left, shortcut chip on
+  // the right (syncMenu rewrites the action half as state changes)
+  const btn = (btns, action, key, fn) => {
+    const b = createButton('');
+    b.html('<span class="action">' + action + '</span><span class="key">' + key + '</span>');
+    b.parent(btns);
     b.mousePressed(fn);
     return b;
   };
-  const sep = () => createSpan('|').parent(bar).class('sep');
 
-  menuButtons.freeze = btn('freeze (F)', () => { const s = selSphere(); if (s) s.frozen = !s.frozen; });
-  menuButtons.reset  = btn('reset (R)',  () => { const s = selSphere(); if (s) { s.sx = s.sy = s.sz = 1; s.rx = s.ry = 0; } });
-  menuButtons.del    = btn('delete (⌫)', deleteSphere);
-  sep();
-  menuButtons.grid   = btn('grid: off (G)', () => { showGrid = !showGrid; });
-  sep();
-  menuButtons.save   = btn('save (S)', saveScene);
-  menuButtons.load   = btn('load (L)', () => fileEl.elt.click());
-  menuButtons.record = btn('record (`)', recordKeypress);
+  const selection = btnRow(addSection(menuEl, 'selection'));
+  menuButtons.freeze = btn(selection, 'freeze', '⇧F', () => { const s = selSphere(); if (s) s.frozen = !s.frozen; });
+  menuButtons.reset  = btn(selection, 'reset', '⇧R',  () => { const s = selSphere(); if (s) { s.sx = s.sy = s.sz = 1; faceCamera(s); } });
+  menuButtons.del    = btn(selection, 'delete', '⌫', deleteSphere);
 
-  const hint = createDiv(
-    'type a letter or number: spawn &nbsp;&nbsp; click sphere: select &nbsp;&nbsp; drag: move &nbsp;&nbsp; shift+drag: rotate &nbsp;&nbsp; arrows / [ ]: stretch<br>' +
-    'drag empty space: orbit &nbsp;&nbsp; scroll: zoom &nbsp;&nbsp; right-click: save image &nbsp;&nbsp;·&nbsp;&nbsp; ' +
-    'typeface: <a href="https://fonts.google.com/specimen/Aladin" target="_blank">Aladin by Santiago Orozco (SIL OFL)</a>'
-  );
-  hint.parent(bar);
-  hint.class('hint');
+  const view = btnRow(addSection(menuEl, 'view'));
+  menuButtons.grid = btn(view, 'grid: off', '⇧G', () => { showGrid = !showGrid; });
+  menuButtons.spin = btn(view, 'auto-rotate: off', '⇧A', () => { autoRotate = !autoRotate; });
+
+  const fileSec = addSection(menuEl, 'file');
+  const file = btnRow(fileSec);
+  menuButtons.save   = btn(file, 'save', '⇧S', saveScene);
+  menuButtons.load   = btn(file, 'load', '⇧L', () => fileEl.elt.click());
+  menuButtons.record = btn(file, 'record loop', '`', recordKeypress);
+  menuButtons.square = btn(file, 'save square', '⇧I', saveSquare);
+  addRecordStatus(fileSec);
+
+  const deploySec = addSection(menuEl, 'deploy');
+  btn(btnRow(deploySec), 'save settings', '', saveSettings);
+  menuButtons.status = createDiv('deployed version boots from this arrangement');
+  menuButtons.status.class('save-status');
+  menuButtons.status.parent(deploySec);
+}
+
+// writes the current arrangement (spheres, grid toggle, camera) to
+// settings.js via the dev-only route, for the deployed sketch to boot from
+async function saveSettings() {
+  const status = menuButtons.status.elt;
+  status.textContent = 'saving…';
+  try {
+    const res = await fetch('/api/dev/sketch-settings?slug=sphixel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        settings: { scene: sceneData(), showGrid, camera: easycam.getState() },
+      }),
+    });
+    const out = await res.json();
+    status.textContent = out.ok ? 'saved settings.js — commit to deploy' : 'not saved: ' + out.reason;
+  } catch {
+    status.textContent = 'not saved — saving needs next dev';
+  }
+}
+
+// right panel, hugging the square's right edge: one row per gesture
+function addHint() {
+  hintEl = createDiv('');
+  hintEl.id('hint');
+  hintEl.class('panel');
+  hintEl.parent(frameEl);
+
+  const controls = addSection(hintEl, 'controls');
+  // deployed is view-only: just the camera
+  const gestures = EDIT_MODE
+    ? [
+        ['type a-z 0-9', 'spawn'],
+        ['click', 'select sphere'],
+        ['drag', 'move'],
+        ['shift+drag', 'rotate'],
+        ['arrows / [ ]', 'stretch'],
+        ['drag space', 'orbit'],
+        ['scroll', 'zoom'],
+        ['right-click', 'save square'],
+        ['backspace', 'delete'],
+      ]
+    : [
+        ['drag', 'orbit'],
+        ['scroll / pinch', 'zoom'],
+      ];
+  for (const [gesture, effect] of gestures) {
+    const row = createDiv('');
+    row.class('row');
+    row.parent(controls);
+    createSpan(gesture).parent(row);
+    createSpan(effect).parent(row);
+  }
+  // typeface credit: the overlay's credits list (experiment record)
 }
 
 function selSphere() {
@@ -183,18 +312,27 @@ function deleteSphere() {
   selectedIndex = -1;
 }
 
+// rewrite a button's action half, leaving the shortcut chip alone
+function setAction(button, text) {
+  button.elt.querySelector('.action').textContent = text;
+}
+
 // enable/disable and relabel the buttons to match selection, grid and
 // frozen state; skipped unless something changed
 function syncMenu() {
+  if (!menuEl) return;
   const sel = selSphere();
-  const state = selectedIndex + ',' + (sel && sel.frozen) + ',' + showGrid + ',' + spheres.length;
+  const state = selectedIndex + ',' + (sel && sel.frozen) + ',' + showGrid + ',' + spheres.length +
+    ',' + autoRotate + ',' + spheres.filter((s) => s.frozen).length;
   if (state === menuState) return;
   menuState = state;
+  setAction(menuButtons.freeze, sel && sel.frozen ? 'unfreeze' : 'freeze');
   menuButtons.freeze.elt.disabled = !sel;
-  menuButtons.freeze.elt.textContent = sel && sel.frozen ? 'unfreeze (F)' : 'freeze (F)';
   menuButtons.reset.elt.disabled = !sel;
   menuButtons.del.elt.disabled = !spheres.length;
-  menuButtons.grid.elt.textContent = showGrid ? 'grid: on (G)' : 'grid: off (G)';
+  setAction(menuButtons.grid, showGrid ? 'grid: on' : 'grid: off');
+  setAction(menuButtons.spin, autoRotate ? 'auto-rotate: on' : 'auto-rotate: off');
+  describeLoop(); // what record loop would capture now
 }
 
 function addLoader() {
@@ -229,7 +367,7 @@ function sphereFromSaved(d) {
   const s = new LetterSphere(typeof d.letter == 'string' && d.letter.length ? d.letter : '?');
   s.x = +d.x || 0;   s.y = +d.y || 0;   s.z = +d.z || 0;
   s.sx = +d.sx || 1; s.sy = +d.sy || 1; s.sz = +d.sz || 1;
-  s.rx = +d.rx || 0; s.ry = +d.ry || 0;
+  s.rx = +d.rx || 0; s.ry = +d.ry || 0; s.rz = +d.rz || 0;
   s.fontSize = +d.fontSize || 100;
   s.frozen = !!d.frozen;
   s.direction = d.direction < 0 ? -1 : 1;
@@ -280,14 +418,23 @@ function buildGridGeometry() {
   }
 }
 
-// read each cell's bit straight from the buffer's pixel array
+// each cell votes from its sub-samples straight in the buffer's pixel
+// array: ink is anything darker than mid-gray (the font antialiases its
+// edges), and the cell lights when at least half the votes are ink
 function sampleSphere(s) {
   drawToBuffer(s.letter, s.fontSize);
   buffer.loadPixels();
   const px = buffer.pixels;
   for (let n = 0 ; n < elements.length ; n++) {
-    const el = elements[n];
-    s.bits[n] = el.inBuffer && px[el.pixIndex] === 0 ? 1 : 0;
+    const idx = elements[n].pixIdx;
+    let ink = 0, seen = 0;
+    for (let i = 0 ; i < idx.length ; i++) {
+      const p = idx[i];
+      if (p < 0) continue; // sub-sample outside the buffer
+      seen++;
+      if (px[p] < 128) ink++;
+    }
+    s.bits[n] = seen > 0 && ink * 2 >= seen ? 1 : 0;
   }
   s.lastSampled = s.fontSize;
 }
@@ -304,12 +451,15 @@ function updatePulse(s) {
   }
 }
 
-// each on-cell is a quad spanning its full longitude section
+// each on-cell is a quad spanning its full longitude section. with the
+// grid on the cells draw inset, so the letter separates into the cells
+// its pixels occupy instead of merging into one solid blob
 function drawSphere(s, selected) {
   push();
   translate(s.x, s.y, s.z);
   rotateX(s.rx);
   rotateY(s.ry);
+  rotateZ(s.rz);
   scale(s.sx, s.sy, s.sz);
   noStroke();
   fill(20);
@@ -317,37 +467,61 @@ function drawSphere(s, selected) {
   for (let n = 0 ; n < elements.length ; n++) {
     if (!s.bits[n]) continue;
     const el = elements[n];
-    vertex(el.ax, el.ay, el.az);
-    vertex(el.bx, el.by, el.bz);
-    vertex(el.cx, el.cy, el.cz);
-    vertex(el.ax, el.ay, el.az);
-    vertex(el.cx, el.cy, el.cz);
-    vertex(el.dx, el.dy, el.dz);
+    if (showGrid) {
+      vertex(el.iax, el.iay, el.iaz);
+      vertex(el.ibx, el.iby, el.ibz);
+      vertex(el.icx, el.icy, el.icz);
+      vertex(el.iax, el.iay, el.iaz);
+      vertex(el.icx, el.icy, el.icz);
+      vertex(el.idx, el.idy, el.idz);
+    } else {
+      vertex(el.ax, el.ay, el.az);
+      vertex(el.bx, el.by, el.bz);
+      vertex(el.cx, el.cy, el.cz);
+      vertex(el.ax, el.ay, el.az);
+      vertex(el.cx, el.cy, el.cz);
+      vertex(el.dx, el.dy, el.dz);
+    }
   }
   endShape();
-  if (showGrid) {
+  // the lattice doubles as the selection indicator: gray context lines for
+  // the unselected, the selection hue at full weight for the selected --
+  // orange when the pulse is frozen, cyan otherwise
+  if (showGrid || selected) {
     noFill();
-    stroke(0, 0, 70);
-    strokeWeight(0.5);
+    if (selected) {
+      stroke(s.frozen ? 8 : 50, 100, 100);
+      strokeWeight(1);
+    } else {
+      stroke(0, 0, 70);
+      strokeWeight(0.5);
+    }
     push();
     scale(1.003); // float just above the letter cells so lines never z-fight
     model(gridGeom);
     pop();
   }
-  if (selected) {
-    noFill();
-    stroke(s.frozen ? 8 : 50, 100, 100); // orange when the pulse is frozen, cyan otherwise
-    sphere(sphereR, 24, 16);
-  }
   pop();
 }
 
 function draw(){
-  myRecord();
+  if (!recordBeforeFrame()) return;
   background(255);
   syncMenu();
 
   if (drag) easycam.setState(drag.camState); // keep the camera still while dragging a letter
+
+  // turntable: the whole scene turns about the world's y axis. Left on the
+  // matrix (no push/pop), so picking, which projects with the matrix the
+  // frame ended on, still finds the spheres where they're drawn
+  if (autoRotate) {
+    const frames = turnFrames();
+    // the turn's length follows the pulse loop; keep the angle if it changes
+    if (spinFrames && frames !== spinFrames) spinFrame = Math.round(spinFrame * frames / spinFrames);
+    spinFrames = frames;
+    spinFrame = (spinFrame + 1) % frames;
+    rotateY(360 * spinFrame / frames); // angleMode is DEGREES
+  }
 
   for (let i = 0 ; i < spheres.length ; i++) {
     const s = spheres[i];
@@ -355,6 +529,33 @@ function draw(){
     if (s.fontSize != s.lastSampled) sampleSphere(s);
     drawSphere(s, i == selectedIndex);
   }
+}
+
+// Turn a sphere so its letter faces the camera as the scene stands right now
+// (camera orbit and turntable spin), upright on screen. SPAWN_RX faces the
+// identity camera; this undoes the view's rotation (the matrix the last frame
+// ended on: camera × spin, which spheres push/pop around) and applies that
+// pose, decomposed into the rotateX·rotateY·rotateZ drawSphere applies.
+function faceCamera(s) {
+  const m = rendererGL.uMVMatrix.mat4; // column-major
+  const V = (r, c) => m[c * 4 + r];
+  const t = radians(SPAWN_RX); // angleMode is DEGREES
+  const D = [[1, 0, 0], [0, Math.cos(t), -Math.sin(t)], [0, Math.sin(t), Math.cos(t)]];
+  // W = Vᵀ·D: the view's inverse rotation, then the face-on pose
+  const W = [0, 1, 2].map((r) => [0, 1, 2].map((c) =>
+    V(0, r) * D[0][c] + V(1, r) * D[1][c] + V(2, r) * D[2][c]));
+  const b = Math.asin(Math.max(-1, Math.min(1, W[0][2])));
+  let a, c;
+  if (Math.abs(Math.cos(b)) > 1e-6) {
+    a = Math.atan2(-W[1][2], W[2][2]);
+    c = Math.atan2(-W[0][1], W[0][0]);
+  } else { // gimbal lock: fold the roll into rx
+    a = Math.atan2(W[2][1], W[1][1]);
+    c = 0;
+  }
+  s.rx = degrees(a);
+  s.ry = degrees(b);
+  s.rz = degrees(c);
 }
 
 // world -> screen pixels, or null if behind the camera
@@ -389,9 +590,13 @@ function pickSphere(mx, my) {
 }
 
 // only reached when the grab interceptor let the event through,
-// i.e. the click was on empty space
-function mousePressed(){
+// i.e. the click was on empty space. p5 fires this from a window-level
+// listener, so it also sees mousedowns on the panels' buttons -- those
+// must not deselect (the button's own handler already ran by then)
+function mousePressed(e){
+  if (!EDIT_MODE) return;
   if (mouseButton != LEFT) return;
+  if (e && e.target !== canvas) return;
   selectedIndex = -1;
 }
 
@@ -426,7 +631,7 @@ function applyDrag(mx, my){
   const dx = mx - drag.mx, dy = my - drag.my;
   if (drag.mode == 'rotate') {
     s.ry += dx * 0.4;
-    s.rx += dy * 0.4;
+    s.rx -= dy * 0.4; // reversed: a face-on letter's surface follows the drag
     drag.mx = mx; drag.my = my;
   } else {
     // solve the screen-space drag against the camera-plane basis;
@@ -440,6 +645,8 @@ function applyDrag(mx, my){
 }
 
 function keyPressed(){
+  if (!EDIT_MODE) return; // deployed is view-only: no typing, no edits
+  if (take) return false; // locked while a take renders the loop
   if (keyCode == 192) { // ` key
     recordKeypress();
     return false;
@@ -450,18 +657,24 @@ function keyPressed(){
     if (keyIsDown(SHIFT)) {
       if (key == 'G') {
         showGrid = !showGrid;
+      } else if (key == 'A') {
+        autoRotate = !autoRotate;
       } else if (key == 'F' && sel) {
         sel.frozen = !sel.frozen;
       } else if (key == 'R' && sel) {
         sel.sx = sel.sy = sel.sz = 1;
-        sel.rx = sel.ry = 0;
-      } else if (key == 'S') {
+        faceCamera(sel);
+      } else if (EDIT_MODE && key == 'S') {
         saveScene();
-      } else if (key == 'L') {
+      } else if (EDIT_MODE && key == 'L') {
         fileEl.elt.click();
+      } else if (EDIT_MODE && key == 'I') {
+        saveSquare();
       }
     } else {
-      spheres.push(new LetterSphere(key.toUpperCase()));
+      const s = new LetterSphere(key.toUpperCase());
+      faceCamera(s);
+      spheres.push(s);
     }
     return false;
   }
@@ -485,17 +698,45 @@ function keyPressed(){
   return false;
 }
 
+// export filenames carry a spx-<DDMMYYYY>-<HHMM> stamp, so successive saves
+// never collide and a still sorts beside the scene it came from
+function spxStamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return p(d.getDate()) + p(d.getMonth() + 1) + d.getFullYear() + '-' + p(d.getHours()) + p(d.getMinutes());
+}
+
 // shift+s: dump every sphere's letter, transform and pulse state to a
 // downloaded JSON file
 function saveScene() {
-  const scene = spheres.map(s => ({
+  saveJSON(sceneData(), 'spx-json-' + spxStamp() + '.json');
+}
+
+// every sphere's letter, transform and pulse state: the shape of both the
+// downloaded JSON and settings.js's `scene`
+function sceneData() {
+  return spheres.map(s => ({
     letter: s.letter,
     x: s.x, y: s.y, z: s.z,
     sx: s.sx, sy: s.sy, sz: s.sz,
-    rx: s.rx, ry: s.ry,
+    rx: s.rx, ry: s.ry, rz: s.rz,
     fontSize: s.fontSize,
     frozen: s.frozen,
     direction: s.direction
   }));
-  saveJSON(scene, 'polar-grid-letters.json');
+}
+
+// shift+i: export the square crop guide's region as a PNG. the WebGL canvas
+// is drawImage'd into a 2D canvas (composited, so no readPixels Y-flip to
+// worry about); the guide itself is DOM, so it never appears in the export
+function saveSquare() {
+  const side = height; // largest square inscribed in the 16:9 canvas
+  const out = document.createElement('canvas');
+  out.width = side;
+  out.height = side;
+  out.getContext('2d').drawImage(canvas, (width - side) / 2, 0, side, side, 0, 0, side, side);
+  const a = document.createElement('a');
+  a.href = out.toDataURL('image/png');
+  a.download = 'spx-' + spxStamp() + '.png';
+  a.click();
 }

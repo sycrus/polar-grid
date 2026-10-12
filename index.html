@@ -5,17 +5,18 @@
 -->
 <html>
   <head>
-    <script src="p5.js"></script>
-    <script src="CCapture.all.min.js"></script>
-    <script src="p5.easycam.min.js"></script>
+    <!-- Libraries are pinned CDN builds; the vendored copies were removed from the repo. -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/p5.easycam@1.2.2/p5.easycam.min.js"></script>
+    <!-- mp4-muxer (MIT): packs the record loop's WebCodecs frames into an MP4 -->
+    <script src="https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.1/build/mp4-muxer.js"></script>
     <link rel="stylesheet" type="text/css" href="style.css">
     <meta charset="utf-8" />
-
-  </head>
   </head>
   <body>
-    <script src="sketch.js"></script>
-    <script src="element.js"></script>
-    <script src="record.js"></script>
+    <script src="settings.js"></script>
+    <script src="sketch.js?v=6"></script>
+    <script src="element.js?v=2"></script>
+    <script src="record.js?v=5"></script>
   </body>
 </html>
